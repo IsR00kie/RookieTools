@@ -4,32 +4,29 @@
 Author: Rookie
 E-mail: hyll8882019@outlook.com
 """
-import logging
 import tldextract
 from collections import deque
-from threading import Lock, Thread
+from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
-from abc import ABC, abstractmethod
-from RookieTools.common import logger, show_run_time, is_url
 from urllib.parse import urlparse
+from RookieTools.CheckBase import CheckBase, abstractmethod
+from RookieTools.logger import logger
+from RookieTools import show_run_time, is_url
+import warnings
 
 
-class PassWordCheckBase(ABC):
+class PassWordCheckBase(CheckBase):
     PluginName = None
     ThreadNumber = 10
     DEBUG = False
 
-    def __init__(self, target: str):
-        logger.setLevel(logging.DEBUG if self.DEBUG else logging.INFO)
+    def __init__(self, target: str, *args, **kwargs):
         self.url = target
         self.result = None
-        self.lock = Lock()
-        self.__file_lock = Lock()
-        self.__task_lock = Lock()
         self.username_task = deque()
         self.password_task = deque()
         self.__password_task = None
-        self.run()
+        super(PassWordCheckBase, self).__init__()
 
     @abstractmethod
     def init_check(self) -> bool:
@@ -70,8 +67,8 @@ class PassWordCheckBase(ABC):
         if is_pass:
             [self.password_task.append(i) for i in domains]
 
-    def __clean_tasks(self):
-        with self.__task_lock:
+    def clean_tasks(self):
+        with self.task_lock:
             if len(self.password_task) or len(self.username_task):
                 logger.info('% -40s正在清空任务队列. 请稍后....' % self.url)
 
@@ -83,19 +80,18 @@ class PassWordCheckBase(ABC):
     def is_exist(self):
         return self.result is not None
 
-    def work_in(self, username: str):
+    def work_in(self, username: str, *args, **kwargs):
         while True:
             try:
                 password = self.__password_task.popleft()
             except IndexError:
                 break
 
-            if self.check(username, password):
-                if self.result:
-                    with self.__file_lock:
-                        self.pipe(self.result)
+            if self.check(username, password) and self.result:
+                with self.file_lock:
+                    self.pipe(self.result)
 
-                self.__clean_tasks()
+                self.clean_tasks()
 
     @abstractmethod
     def pipe(self, result):
@@ -104,7 +100,7 @@ class PassWordCheckBase(ABC):
     @show_run_time('PasswordCheck')
     def run(self):
         status = self.init_check()
-        logger.info('% -40s %s %s' % (self.url, '存在' if status else '不存在', self.PluginName))
+        logger.info('% -40s %s %s' % (self.url, self.PluginName, '初始化检查正常' if status else '初始化检查不正常'))
         if status:
             self.tasks_init()
             while True:
@@ -120,6 +116,8 @@ class PassWordCheckBase(ABC):
 
 
 def pool(targets: list, obj: PassWordCheckBase):
+    warnings.warn("RookieTools.PasswordCheckBase.pool is deprecated since RookieTools 2.0."
+                  "Use RookieTools.pool instead.", DeprecationWarning, stacklevel=2)
     _pool = ThreadPoolExecutor()
     _pool.map(obj, targets)
     _pool.shutdown()

@@ -1,78 +1,37 @@
 # -*- coding: utf-8 -*-
 # !/usr/bin/env/ python3
 """
-通用爆破
 Author: Rookie
 E-mail: hyll8882019@outlook.com
 """
-
 import re
-import zlib
 import time
-import chardet
 import requests
-import logging
 import socket
-from requests import session
-from io import BytesIO
+import warnings
+from concurrent.futures.thread import ThreadPoolExecutor
 from requests.exceptions import ContentDecodingError
-from urllib3.response import GzipDecoder, DeflateDecoder
+from RookieTools.urllib3_hook import hook_start
+from RookieTools.logger import logger
+
+hook_start()
 
 g_headers = {
     'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) '
                   'Chrome/78.0.3904.87 Safari/537.36',
     'Connection': 'close'
 }
-__session = session()
-
-logger = logging.getLogger('Codes')
-handler = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-
-logger.setLevel(logging.INFO)
-
-is_url = lambda x: x.startswith('http://') or x.startswith('https://')
 
 
-def _gzip_boom_check(self, data):
-    if not hasattr(self, 'total'):
-        self.total = 0
-    if not hasattr(self, 'gzip'):
-        self.gzip = zlib.decompressobj(15 + 16)
-
-    with BytesIO(data) as f:
-        while True:
-            buf = self.gzip.unconsumed_tail
-            if not buf:
-                buf = f.read(1024)
-                if not buf:
-                    break
-            got = self.gzip.decompress(buf, 4096)
-            if not got:
-                break
-            self.total += len(got)
-
-        if self.total > ((1 << 30) / 10):
-            raise ContentDecodingError('is GzipBoom data size: %0.2fG' % (self.total / (1 << 30)))
-        else:
-            return _GzipDecoder_decompress(self, data)
+def is_url(url: str) -> bool:
+    return url.startswith('http://') or url.startswith('https://')
 
 
-def deflate_boom_check(self, data):
-    # TODO: 尚未实现deflate压缩炸弹检查
-    return _DeflateDecoder_decompress(self, data)
+def _is_use_session(x: bool, y: dict):
+    return True if x or y.get('stream', False) else False
 
 
-_GzipDecoder_decompress = GzipDecoder.decompress
-GzipDecoder.decompress = _gzip_boom_check
-
-_DeflateDecoder_decompress = DeflateDecoder.decompress
-DeflateDecoder.decompress = deflate_boom_check
-
-
-def _set_headers(is_session, **kwargs):
+def _init_downloader(url, is_session: bool = False, **kwargs):
     if not kwargs.get('headers'):
         kwargs['headers'] = g_headers
     else:
@@ -80,43 +39,8 @@ def _set_headers(is_session, **kwargs):
             if key not in kwargs['headers']:
                 kwargs['headers'][key] = g_headers[key]
 
-    if is_session:
+    if _is_use_session(is_session, kwargs):
         kwargs['headers']['Connection'] = 'Keep-alive'
-
-    return kwargs
-
-
-def _downloader_runtime_check(func):
-    def wrapper(url, *args, **kwargs):
-        try:
-            return func(url, *args, **kwargs)
-        except ContentDecodingError as e:
-            try:
-                info = re.findall('is G?zipBoom data size: .*?G', str(e.args))[0]
-            except IndexError:
-                info = e.args
-
-            if kwargs.get('output_error', False):
-                logger.warning('% -40s %s' % (url, info))
-        except MemoryError:
-            if kwargs.get('output_error', False):
-                logger.warning('内存使用限制为1G: %s, 超过. 可能为压缩包炸弹' % url)
-        except requests.exceptions.TooManyRedirects:
-            if kwargs.get('output_error', False):
-                logger.warning('重定向次数过多: %s' % url)
-        except requests.exceptions.RequestException as e:
-            if kwargs.get('output_error', False):
-                logger.error('network error: %s, %s' % (url, e.args))
-        except Exception as e:
-            logger.error('network error: %s, %s' % (url, e.args))
-            logger.exception(e)
-        return None
-
-    return wrapper
-
-
-@_downloader_runtime_check
-def downloader(url: str, is_session: bool = False, **kwargs):
     if not url:
         return None
 
@@ -126,17 +50,46 @@ def downloader(url: str, is_session: bool = False, **kwargs):
     if 'timeout' not in kwargs:
         kwargs['timeout'] = 30
 
-    res_data = {'url': url, **_set_headers(is_session, **kwargs)}
-    if 'data' in kwargs:
-        if is_session:
-            return requests.post(**res_data)
-        else:
-            return __session.post(**res_data)
+    return {'url': url, **kwargs}
 
-    if is_session:
-        return requests.get(**res_data)
-    else:
-        return __session.get(**res_data)
+
+def _downloader_runtime_check(func):
+    def wrapper(url, *args, **kwargs):
+        output_error = kwargs.pop('output_error', False)
+        try:
+            return func(url, *args, **kwargs)
+        except ContentDecodingError as e:
+            if output_error:
+                logger.warning('% -40s %s' % (url, re.findall('is G?zipBoom data size: .*?G', str(e.args))[0]))
+        except requests.exceptions.RequestException as e:
+            if output_error:
+                logger.error('network error: %s, %s' % (url, e.args))
+        except Exception as e:
+            if output_error:
+                logger.error('network error: %s, %s' % (url, e.args))
+                logger.exception(e)
+        return None
+
+    return wrapper
+
+
+@_downloader_runtime_check
+def downloader(url: str, is_session: bool = False, is_head: bool = False, **kwargs):
+    def _send(func):
+        if _is_use_session(is_session, kwargs):
+            return eval('requests.session().%s' % func)(**res_data)
+        else:
+            return eval('requests.%s' % func)(**res_data)
+
+    res_data = _init_downloader(url, is_session, **kwargs)
+
+    if is_head:
+        return _send('head')
+
+    if 'data' in kwargs:
+        return _send('post')
+
+    return _send('get')
 
 
 def get_charset(resp) -> (str, None):
@@ -154,7 +107,7 @@ def get_charset(resp) -> (str, None):
         charset = charset.strip()
     except IndexError as e:
         try:
-            return chardet.detect(resp.content)['encoding']
+            return resp.apparent_encoding
         except Exception as e:
             # logger.exception(e)
             logger.warning('get % -40s charset fail' % resp.url)
@@ -209,6 +162,8 @@ def show_run_time(name):
 
 
 def host2ip(domain):
+    warnings.warn("RookieTools.common.host2ip is deprecated since RookieTools 2.0."
+                  "Use RookieTools.host2ip instead.", DeprecationWarning, stacklevel=2)
     try:
         host = socket.gethostbyname(domain)
     except Exception as e:
@@ -220,6 +175,8 @@ def host2ip(domain):
 
 
 def is_open_port(host: str, port: int) -> bool:
+    warnings.warn("RookieTools.common.is_open_port is deprecated since RookieTools 2.0."
+                  "Use RookieTools.is_open_port instead.", DeprecationWarning, stacklevel=2)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(2)
@@ -232,8 +189,18 @@ def is_open_port(host: str, port: int) -> bool:
         return False
 
 
+def pool(targets: list, obj: object, n: int = None, pool_obj=None):
+    def run():
+        if pool_obj is None:
+            _pool = ThreadPoolExecutor(max_workers=n)
+        else:
+            # FIXME: ProcessPoolExecutor 执行卡死BUG
+            _pool = pool_obj(max_workers=n)
+        _pool.map(obj, targets)
+        _pool.shutdown()
+
+    run()
+
+
 if __name__ == '__main__':
-    _resp = downloader('http://127.0.0.1', is_session=True)
-    if not _resp:
-        exit()
-    print(html_decode(_resp))
+    downloader('http://127.0.0.1', output_error=True)
