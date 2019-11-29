@@ -36,21 +36,7 @@ logger.setLevel(logging.INFO)
 is_url = lambda x: x.startswith('http://') or x.startswith('https://')
 
 
-def _set_headers(is_session, **kwargs):
-    headers = kwargs.get('headers')
-    if not headers:
-        headers = g_headers
-    else:
-        for key in ['User-Agent', 'Connection']:
-            if key not in headers:
-                headers[key] = g_headers[key]
-
-    if is_session:
-        headers['Connection'] = 'Keep-alive'
-    return headers
-
-
-def gzip_boom_check(self, data):
+def _gzip_boom_check(self, data):
     if not hasattr(self, 'total'):
         self.total = 0
     if not hasattr(self, 'gzip'):
@@ -77,81 +63,80 @@ def gzip_boom_check(self, data):
 def deflate_boom_check(self, data):
     # TODO: 尚未实现deflate压缩炸弹检查
     return _DeflateDecoder_decompress(self, data)
-    # with BytesIO(data) as f:
-    #     while True:
-    #         buf = self.gzip.unconsumed_tail
-    #         if not buf:
-    #             buf = f.read(4096)
-    #             if not buf:
-    #                 break
-    #         got = self.gzip.decompress(buf)
-    #         if not got:
-    #             break
-    #         self.total += len(got)
-    #         print(self.total)
-    #     if self.total > ((1 << 30) / 2):
-    #         raise ContentDecodingError('is GzipBoom data size: %0.2fG' % (self.total / (1 << 30)))
-    #     else:
-    #         return _DeflateDecoder_decompress(self, data)
-    # _DeflateDecoder_decompress(self, data)
 
 
 _GzipDecoder_decompress = GzipDecoder.decompress
-GzipDecoder.decompress = gzip_boom_check
+GzipDecoder.decompress = _gzip_boom_check
 
 _DeflateDecoder_decompress = DeflateDecoder.decompress
 DeflateDecoder.decompress = deflate_boom_check
 
 
-def init_boom_check(func):
-    def wrapper(*args, **kwargs):
-        return func(*args, **kwargs)
+def _set_headers(is_session, **kwargs):
+    if not kwargs.get('headers'):
+        kwargs['headers'] = g_headers
+    else:
+        for key in ['User-Agent', 'Connection']:
+            if key not in kwargs['headers']:
+                kwargs['headers'][key] = g_headers[key]
+
+    if is_session:
+        kwargs['headers']['Connection'] = 'Keep-alive'
+
+    return kwargs
+
+
+def _downloader_runtime_check(func):
+    def wrapper(url, *args, **kwargs):
+        try:
+            return func(url, *args, **kwargs)
+        except ContentDecodingError as e:
+            try:
+                info = re.findall('is G?zipBoom data size: .*?G', str(e.args))[0]
+            except IndexError:
+                info = e.args
+
+            if kwargs.get('output_error', False):
+                logger.warning('% -40s %s' % (url, info))
+        except MemoryError:
+            if kwargs.get('output_error', False):
+                logger.warning('内存使用限制为1G: %s, 超过. 可能为压缩包炸弹' % url)
+        except requests.exceptions.TooManyRedirects:
+            if kwargs.get('output_error', False):
+                logger.warning('重定向次数过多: %s' % url)
+        except requests.exceptions.RequestException as e:
+            if kwargs.get('output_error', False):
+                logger.error('network error: %s, %s' % (url, e.args))
+        except Exception as e:
+            logger.error('network error: %s, %s' % (url, e.args))
+            logger.exception(e)
+        return None
 
     return wrapper
 
 
-@init_boom_check
+@_downloader_runtime_check
 def downloader(url: str, is_session: bool = False, **kwargs):
     if not url:
         return None
 
-    if not (url.startswith('http://') or url.startswith('https://')):
+    if not is_url(url):
         url = 'http://' + url
 
     if 'timeout' not in kwargs:
         kwargs['timeout'] = 30
 
-    res_data = {'url': url, 'headers': _set_headers(is_session, **kwargs), **kwargs}
-    try:
-        if 'data' in kwargs:
-            if is_session:
-                return requests.post(**res_data)
-            else:
-                return __session.post(**res_data)
-
+    res_data = {'url': url, **_set_headers(is_session, **kwargs)}
+    if 'data' in kwargs:
         if is_session:
-            return requests.get(**res_data)
+            return requests.post(**res_data)
         else:
-            return __session.get(**res_data)
-    except ContentDecodingError as e:
-        try:
-            info = re.findall('is G?zipBoom data size: .*?G', str(e.args))[0]
-        except IndexError:
-            info = e.args
+            return __session.post(**res_data)
 
-        logger.warning('% -40s %s' % (url, info))
-    except MemoryError:
-        logger.warning('内存使用限制为1G: %s, 超过. 可能为压缩包炸弹' % url)
-    except requests.exceptions.TooManyRedirects:
-        logger.warning('重定向次数过多: %s' % url)
-    except requests.exceptions.RequestException:
-        # logger.error('network error: %s, %s' % (url, e.args))
-        pass
-    except Exception as e:
-        logger.error('network error: %s, %s' % (url, e.args))
-        logger.exception(e)
-
-    return None
+    if is_session:
+        return requests.get(**res_data)
+    else:
+        return __session.get(**res_data)
 
 
 def get_charset(resp) -> (str, None):
@@ -248,7 +233,7 @@ def is_open_port(host: str, port: int) -> bool:
 
 
 if __name__ == '__main__':
-    _resp = downloader('http://127.0.0.1')
+    _resp = downloader('http://127.0.0.1', is_session=True)
     if not _resp:
         exit()
     print(html_decode(_resp))
